@@ -246,6 +246,17 @@ class DependencyPathsRequest(AuditLockRequest):
     )
 
 
+class InstallPlanRequest(AuditLockRequest):
+    """POST /install-plan 的请求体：沿用 /audit-lock 全部字段（/resolve 字段 + current_lock）。
+
+    先按 /audit-lock 的同一套规则校验 current_lock；锁有效时只对根可达包
+    按锁定版本的已激活依赖建图，强连通分量压缩为 DAG 后输出依赖优先的
+    并行安装 batches。
+    """
+
+    model_config = {"extra": "forbid"}
+
+
 class SbomRequest(AuditLockRequest):
     """POST /sbom 的请求体：沿用 /audit-lock 全部字段（/resolve 字段 + current_lock）。
 
@@ -648,6 +659,71 @@ class AuditLockResponse(BaseModel):
             "（missing、unavailable、constraint_mismatch、extraneous），"
             "再按规范化包名。"
         ),
+    )
+
+
+# --------------------------------------------------------------------- #
+# POST /install-plan 响应
+# --------------------------------------------------------------------- #
+class InstallBatchItemOut(BaseModel):
+    """安装批次中的一个可并行安装单元：单个非循环包或一个循环 SCC。"""
+
+    model_config = {"extra": "forbid"}
+
+    packages: list[str] = Field(
+        ...,
+        description=(
+            "该单元包含的 PEP 503 规范化包名，按名称排序；非循环单元恰有"
+            "一个包，循环单元列出该强连通分量的全部内部包（须作为一个整体安装）。"
+        ),
+    )
+    cyclic: bool = Field(
+        ...,
+        description=(
+            "是否为循环强连通分量：多包 SCC 恒为 true；单包仅在存在自环"
+            "（该包锁定版本显式依赖自身）时为 true。"
+        ),
+    )
+
+
+class InstallBatchOut(BaseModel):
+    """一个并行安装批次：批内各 item 互不依赖，可同时安装。"""
+
+    model_config = {"extra": "forbid"}
+
+    index: int = Field(
+        ...,
+        description=(
+            "批次下标，从 0 起按依赖方向递增：任一依赖所在批次严格早于"
+            "依赖它的包；根包所在分量在最大下标批次（最后一批）。"
+        ),
+    )
+    items: list[InstallBatchItemOut] = Field(
+        ...,
+        description=(
+            "本批可并行安装的单元：先按非循环在前、循环在后，再按首包名"
+            "与整个包名元组确定性排序。"
+        ),
+    )
+
+
+class InstallPlanResponse(BaseModel):
+    """锁有效时的依赖优先并行安装计划。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    batches: list[InstallBatchOut] = Field(
+        ...,
+        description=(
+            "依赖优先的并行安装批次（SCC 缩点 DAG 的最长路径分层）："
+            "第 0 批为无图内依赖的最底层包，根包所在分量恒在最后一批。"
+        ),
+    )
+    package_count: int = Field(
+        ...,
+        description="安装计划覆盖的根可达包总数（各批 item 包数之和）。"
     )
 
 

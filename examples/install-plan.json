@@ -1,0 +1,57 @@
+{
+  "repository": {
+    "app": [
+      {
+        "version": "1.0.0",
+        "dependencies": [
+          {"name": "core", "specifier": ">=2.0"},
+          {"name": "cyc-a", "specifier": ""},
+          {"name": "selfy", "specifier": ""},
+          {"name": "leaf", "specifier": ""}
+        ]
+      }
+    ],
+    "core": [
+      {"version": "2.0.0", "dependencies": [
+        {"name": "util", "specifier": ""},
+        {"name": "base", "specifier": ""}
+      ]}
+    ],
+    "util": [
+      {"version": "1.0", "dependencies": [{"name": "base", "specifier": ""}]}
+    ],
+    "leaf": [
+      {"version": "1.0", "dependencies": [{"name": "base", "specifier": ""}]}
+    ],
+    "base": [
+      {"version": "1.0"}
+    ],
+    "cyc-a": [
+      {"version": "1.0", "dependencies": [{"name": "cyc-b", "specifier": ""}]}
+    ],
+    "cyc-b": [
+      {"version": "1.0", "dependencies": [{"name": "cyc-a", "specifier": ""}]}
+    ],
+    "selfy": [
+      {"version": "1.0", "dependencies": [{"name": "selfy", "specifier": ""}]}
+    ]
+  },
+  "root": "app",
+  "specifier": "",
+  "allow_prereleases": false,
+  "target_environment": {
+    "python_version": "3.11",
+    "sys_platform": "linux",
+    "platform_machine": "x86_64"
+  },
+  "current_lock": {
+    "app": "1.0.0",
+    "base": "1.0",
+    "core": "2.0.0",
+    "cyc-a": "1.0",
+    "cyc-b": "1.0",
+    "leaf": "1.0",
+    "selfy": "1.0",
+    "util": "1.0"
+  }
+}

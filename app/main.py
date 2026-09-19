@@ -18,6 +18,11 @@
   的所有有效解中最小化非目标包相对 current_lock 的变化数量
 * POST /audit-lock  只审计不求解：按 current_lock 的锁定版本从根包遍历
   已激活依赖，报告 missing/unavailable/constraint_mismatch/extraneous
+* POST /install-plan
+  先按 /audit-lock 规则校验 current_lock；无效返回 409 审计问题，
+  有效则只对根可达包按已激活依赖建图，把强连通分量压缩为 DAG，
+  输出依赖优先的并行安装 batches（同一循环分量作为一个 batch item，
+  标记 cyclic 并列出内部包；批次/分量/包名确定性排序，根分量在最后一批）
 * POST /dependency-paths
   先按 /audit-lock 规则校验 current_lock；无效返回 409 审计问题，
   有效则按锁定版本与目标环境已激活依赖建图，返回根包到目标包的
@@ -54,6 +59,7 @@ from fastapi.responses import JSONResponse
 from packaging.version import Version
 
 from .audit import audit_lock
+from .install_plan import build_install_batches
 from .license_policy import evaluate_license_policy
 from .lock_diff import diff_locks
 from .lock_groups import (
@@ -81,6 +87,8 @@ from .schemas import (
     DependencyPathsResponse,
     ExplainVersionRequest,
     ExplainVersionResponse,
+    InstallPlanRequest,
+    InstallPlanResponse,
     InvalidLockResponse,
     InvalidSnapshotResponse,
     LicensePolicyRequest,
@@ -110,7 +118,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -648,6 +656,67 @@ def audit_lock_endpoint(request: AuditLockRequest):
         allow_prereleases=request.allow_prereleases,
     )
     return {"status": "ok", **result}
+
+
+@app.post(
+    "/install-plan",
+    summary="在有效锁定清单上输出依赖优先的并行安装批次（SCC 缩点 DAG 分层）",
+    response_model=InstallPlanResponse,
+    responses={
+        409: {"model": InvalidLockResponse, "description": "锁定清单未通过审计"},
+        422: {"model": InvalidSnapshotResponse, "description": "快照或 current_lock 非法"},
+    },
+)
+def install_plan_endpoint(request: InstallPlanRequest):
+    root_canonical = canonical(request.root)
+    payload = request.model_dump()
+
+    try:
+        repo = build_repository(payload["repository"], payload["target_environment"])
+        root_spec = parse_root_specifier(request.specifier)
+        current_lock = parse_current_lock(payload["current_lock"])
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    if not repo.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    # 先按现有审计规则校验锁定清单；无效则带确定性排序的问题返回 409，
+    # 不构建任何安装计划。
+    result = audit_lock(
+        repo,
+        root_name=root_canonical,
+        root_spec=root_spec,
+        root_raw=request.specifier,
+        current_lock=current_lock,
+        allow_prereleases=request.allow_prereleases,
+    )
+    if not result["valid"]:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "invalid_lock",
+                "message": "锁定清单未通过审计，未生成安装计划",
+                "issues": result["issues"],
+            },
+        )
+
+    # 有效锁：只对根可达包按锁定版本的已激活依赖建图（与 /dependency-paths、
+    # /sbom 同一张图），SCC 压缩为 DAG 后做依赖优先分层。
+    graph = build_locked_graph(
+        repo, root_name=root_canonical, current_lock=current_lock
+    )
+    document = build_install_batches(graph, root_name=root_canonical)
+    return {"status": "ok", "root": root_canonical, **document}
 
 
 @app.post(
