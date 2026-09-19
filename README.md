@@ -15,6 +15,11 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 `/dependency-paths` 在审计通过的锁定清单上**解释目标包为何出现**：按锁定
 版本与目标环境激活的依赖建图，返回从根包到目标包的全部最短包路径
 （菱形依赖保留等长路径，依赖环不重复节点、不会无限遍历）。
+`/install-plan` 同样在审计通过的锁定清单上**规划并行安装顺序**：只对根
+可达包按已激活依赖建图，把**强连通分量压缩为 DAG**，输出**依赖优先的
+并行安装批次**——同一批内的包互不依赖可并行安装，循环依赖的包收缩为
+一个标记 `cyclic` 的原子 batch item（列出内部包），批次/分量/包名全部
+确定性排序，根包所在分量处于最后一批。
 `/sbom` 同样**先审计 `current_lock`**，锁有效时沿已激活依赖图导出
 **确定性 JSON 物料清单（SBOM）**：每个包给出规范化名称、版本、PURL
 （Package URL）、依赖名称及候选版本随快照携带的 `source_url` / `sha256`
@@ -75,6 +80,7 @@ docker compose up --build
 | 升级接口 | `POST http://localhost:8000/upgrade` |
 | 审计接口 | `POST http://localhost:8000/audit-lock` |
 | 依赖路径接口 | `POST http://localhost:8000/dependency-paths` |
+| 安装计划接口 | `POST http://localhost:8000/install-plan` |
 | SBOM 导出接口 | `POST http://localhost:8000/sbom` |
 | 许可证策略接口 | `POST http://localhost:8000/license-policy` |
 | 锁差异比较接口 | `POST http://localhost:8000/lock-diff` |
@@ -880,6 +886,94 @@ curl -s -X POST http://localhost:8000/dependency-paths \
 | `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不执行路径查询 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本、`target` 名称非法 |
 
+### `POST /install-plan`
+
+在**审计通过的锁定清单**上规划**依赖优先的并行安装批次**。请求体沿用
+`/audit-lock` 的全部字段（`/resolve` 字段 + `current_lock`，语义完全
+一致），无额外字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `current_lock` | `object` | 是 | 据以规划安装顺序的锁定清单：`{包名: 版本}`，格式同 `/audit-lock` |
+
+处理流程：
+
+1. **先按 `/audit-lock` 的同一套规则校验 `current_lock`**（含目标环境的
+   marker 激活语义）。锁无效时返回 **409**，携带与 `/audit-lock`
+   逐字节一致、确定性排序的 `issues`，**不生成任何安装批次**
+   （响应中没有 `batches` 字段）；
+2. 锁有效时**不做任何版本选择**：按每个包的**锁定版本**展开它在目标
+   环境下的已激活依赖构成有向图（与 `/dependency-paths`、`/sbom` 同一张
+   图；节点集恰为**根可达包**，未激活 marker 依赖不是图的边）；
+3. **强连通分量（SCC）压缩为 DAG**：互相可达（含自环）的包属于同一个
+   强连通分量——环上的包无法以任何先后顺序安装，因此**同一分量作为一个
+   batch item 原子安装**；分量之间的依赖边构成无环图（DAG）；
+4. **依赖优先的最长路径并行分层**：无跨分量依赖的分量在批次 0，其余
+   分量的批次号为其各依赖分量批次号最大值 + 1。由此**任一依赖所在批次
+   严格早于依赖它的包**（不晚于），同一批内的分量互不依赖、可并行安装，
+   且批次数最少。根包沿依赖边可到达每个可达包，故**根包所在分量必然
+   处于最后一批**。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 固定 `"ok"` |
+| `root` | 规范化（PEP 503）后的根包名 |
+| `batches` | 并行安装批次列表，**按安装先后（批次号升序）排列**：先执行批次 0，再执行批次 1，以此类推 |
+| `batches[][]` | 每个 item 是一个安装单元：单包为 `{"cyclic": false, "name": <包名>, "packages": null}`；循环强连通分量为 `{"cyclic": true, "name": null, "packages": [包名...]}` |
+| `batches[][].cyclic` | `false`=单个包（非循环 SCC）；`true`=循环 SCC，分量内的包互相可达、须作为一个原子项安装 |
+| `batches[][].name` | 单包 item 的规范化包名；循环分量为 `null` |
+| `batches[][].packages` | 循环分量内部的全部规范化包名，**按包名排序**；单包 item 为 `null` |
+
+确定性排序：批次按批次号；**同一批内**单包按包名、循环分量按其内部包名
+排序后的元组做字典序排列。结果与包键 / 候选列表 / 依赖声明 / 锁键的
+输入顺序无关。
+
+```bash
+curl -s -X POST http://localhost:8000/install-plan \
+  -H 'Content-Type: application/json' \
+  -d @examples/install-plan.json
+```
+
+示例中 `shared-util 1.5.0` 与 `plugin-a 1.0.0` **互相依赖**构成循环
+分量（最先安装的原子项）；`auth-lib` 与 `web-framework` 都只依赖该
+分量、互不依赖，在第二批**并行**安装；根包 `app` 依赖两者，独占
+最后一批：
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "batches": [
+    [
+      {"cyclic": true, "name": null, "packages": ["plugin-a", "shared-util"]}
+    ],
+    [
+      {"cyclic": false, "name": "auth-lib", "packages": null},
+      {"cyclic": false, "name": "web-framework", "packages": null}
+    ],
+    [
+      {"cyclic": false, "name": "app", "packages": null}
+    ]
+  ]
+}
+```
+
+无环时所有循环项退化为单包：纯线性链 `app → liba → libb → libc` 得到
+四批 `[[libc], [libb], [liba], [app]]`；无依赖的多个独立包与菱形的
+同级依赖同批并行；只有根包一个包时返回仅含一个单包项的批次。
+**自环**（某包依赖自身）同样标记为 `cyclic` 的单包分量；根包自身与
+下游成环时，根循环分量按最长路径规则仍处于最后一批。
+
+`/install-plan` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 锁有效，安装计划生成完成（存在循环分量仍是 200，循环项以 `cyclic: true` 标注） |
+| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不生成安装批次 |
+| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本 |
+
 ### `POST /sbom`
 
 在**审计通过的锁定清单**上导出确定性 JSON 物料清单（SBOM）。请求体沿用
@@ -1451,20 +1545,30 @@ curl -s -X POST http://localhost:8000/explain-version \
     到目标包的全部最短包路径：菱形等长路径全保留，环不重复节点、不会无限
     遍历，路径按字典序确定性排序；目标为根包返回单节点路径，不可达返回
     `reachable: false` 与空路径。
-12. **跨环境矩阵（`/resolve-matrix`）**：对同一份快照与根约束，在 2～8 个
+12. **安装计划（`/install-plan`）**：先复用第 10 条的审计，锁无效即
+    返回 409 且不生成批次；锁有效时只对根可达包按锁定版本的已激活依赖
+    建图（与第 11 条同一张图，无版本选择），用 Kosaraju 算法求强连通
+    分量并把每个分量收缩为一个节点得到 DAG（多成员分量与自环标为循环
+    分量，同一分量须作为一个原子安装项），再在 DAG 上按最长路径分层
+    （层号 = 各依赖分量层号最大值 + 1）输出依赖优先的并行安装批次：
+    同一批内各项互不依赖可并行，任一依赖所在批次严格早于依赖它的包，
+    根包可达全部节点故根包所在分量处于最后一批。批次按层号、批内单包
+    按包名、循环分量按内部包名元组字典序排序，循环分量内部包名排序，
+    输出与输入顺序无关。
+13. **跨环境矩阵（`/resolve-matrix`）**：对同一份快照与根约束，在 2～8 个
     带唯一 `id` 的目标环境上各跑一遍第 2～8 条的同一套求解（环境间完全
     独立、各自回溯与冲突收集）。全部成功时 `results` 按 `id` 排序给出各
     环境锁定清单，`matrix` 按包名排序逐包记录各环境版本（未出现为
     `null`）：所有环境都存在且版本一致为 `shared`，否则（版本不同或仅部分
     环境出现）为 `divergent`；任一环境无解则整体 409，`failures` 按 `id`
     排序给出各失败环境与 `/resolve` 同形的原冲突结果。
-13. **物料清单（`/sbom`）**：先复用第 10 条的审计，锁无效即返回 409 且不
+14. **物料清单（`/sbom`）**：先复用第 10 条的审计，锁无效即返回 409 且不
     导出；锁有效时沿第 11 条的已激活依赖图（按锁定版本、无版本选择）逐包
     导出规范化名称、版本、PURL（`pkg:pypi/<name>@<version>`）、已激活
     依赖名称（去重排序）与候选版本携带的 `source_url` / `sha256` /
     `license` 元数据；元数据缺失不阻断导出，只在 `warnings` 中按包名逐项
     提示；`packages` 按包名排序，输出只取决于快照、环境与锁。
-14. **许可证策略（`/license-policy`）**：先复用第 10 条的审计，锁无效即
+15. **许可证策略（`/license-policy`）**：先复用第 10 条的审计，锁无效即
     返回 409 且不判定；锁有效时在第 11 条的已激活依赖图上逐包读取锁定
     版本的 `metadata.license`：未提供归为未知（不阻断），提供则解析
     SPDX `AND`/`OR`/括号表达式（`OR` 低于 `AND`，括号分组；关键字大小
@@ -1474,7 +1578,7 @@ curl -s -X POST http://localhost:8000/explain-version \
     未知。`violations` 与 `unknowns` 各自按包名排序，每项复用
     第 11 条的最短路径算法附根包到该包的全部最短路径；非法 SPDX 表达式
     （含 `WITH`）、allow/deny 非法标识或两集合重叠返回 422，输出确定。
-15. **锁差异比较（`/lock-diff`）**：同一份快照与目标环境下提交
+16. **锁差异比较（`/lock-diff`）**：同一份快照与目标环境下提交
     before_lock / after_lock，两份锁**各自独立**复用第 10 条的审计
     （即使一份已无效仍审计另一份），任一无效即整体 409 且分别标注
     before/after 的问题、不做比较；均有效时在两张第 11 条的已激活依赖
@@ -1483,7 +1587,7 @@ curl -s -X POST http://localhost:8000/explain-version \
     不产生变化项）；每个变化项分别复用第 11 条的最短路径算法给出其在
     前后图中的全部最短根路径，不存在的一侧为空数组；四类列表各按包名
     排序、路径按字典序排序，交换提交位置结果对称，与输入顺序无关。
-16. **反事实版本解释（`/explain-version`）**：先按第 2～8 条的原规则求出
+17. **反事实版本解释（`/explain-version`）**：先按第 2～8 条的原规则求出
     基准锁定清单（基准无解即返回该次求解的 409）；目标包不在基准锁中
     （从根包不可达）返回 422。随后其余规则不变，仅以一条与根需求并列的
     根级 `==target_version` 约束钉住目标包整体重解（显式钉预发布时该
@@ -1492,7 +1596,7 @@ curl -s -X POST http://localhost:8000/explain-version \
     列表均按包名排序）；不可行时返回 409，复用第 2～8 条的约束来源链
     说明阻塞原因，钉版本约束本身作为一条根级来源链出现。两次求解各自
     使用独立的求解器实例，互不影响冲突收集与尝试计数。
-17. **最少锁组（`/lock-groups`）**：请求与第 12 条的 `/resolve-matrix`
+18. **最少锁组（`/lock-groups`）**：请求与第 13 条的 `/resolve-matrix`
     相同。先逐环境复用第 2～8 条各求一份候选锁，任一环境无解即整体 409
     并按 id 排序保留各失败环境与 `/resolve` 同形的原冲突结果（继续跑完
     其余环境）；全部有解后候选锁按锁内容（规范化包名 → 版本）去重，每份
@@ -1518,6 +1622,7 @@ app/
   resolver.py       # 回溯求解器（候选排序 / MRV / 来源链重建）
   audit.py          # 锁定清单审计（按锁版本遍历 / 环中累计入边 / 四类问题）
   paths.py          # 锁定依赖图建图与根包到目标包的全部最短路径（菱形/环安全）
+  install_plan.py   # 有效锁图 SCC 压缩为 DAG 与依赖优先并行安装批次（循环分量原子项）
   sbom.py           # 沿已激活依赖图导出确定性 JSON SBOM（PURL / 元数据 / 缺失 warnings）
   spdx.py           # SPDX 许可证表达式词法/递归下降解析与 allow/deny 三态求值
   license_policy.py # 有效锁图上的逐包许可证策略判定（违规/未知 + 全部最短路径）
@@ -1526,7 +1631,7 @@ app/
   repository.py     # 快照规范化、PEP 440/503 解析、按环境过滤 marker、候选元数据校验
   markers.py        # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py        # 请求/响应模型
-examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/lock-groups、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy、/lock-diff、/explain-version 示例）
+examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/lock-groups、/upgrade、/audit-lock、/dependency-paths、/install-plan、/sbom、/license-policy、/lock-diff、/explain-version 示例）
 tests/               # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml

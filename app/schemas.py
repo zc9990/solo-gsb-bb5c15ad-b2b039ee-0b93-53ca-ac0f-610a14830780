@@ -257,6 +257,17 @@ class SbomRequest(AuditLockRequest):
     model_config = {"extra": "forbid"}
 
 
+class InstallPlanRequest(AuditLockRequest):
+    """POST /install-plan 的请求体：沿用 /audit-lock 全部字段，无额外字段。
+
+    先按 /audit-lock 的同一套规则校验 current_lock；锁有效时只对根可达
+    包按已激活依赖建图，强连通分量压缩为 DAG 后输出依赖优先的并行
+    安装批次。
+    """
+
+    model_config = {"extra": "forbid"}
+
+
 class LicensePolicyRequest(AuditLockRequest):
     """POST /license-policy 的请求体：在 /audit-lock 字段上附加 allow/deny。
 
@@ -690,6 +701,60 @@ class InvalidLockResponse(BaseModel):
             "与 /audit-lock 完全一致的审计问题，确定性排序：先按类型"
             "（missing、unavailable、constraint_mismatch、extraneous），"
             "再按规范化包名。"
+        ),
+    )
+
+
+# --------------------------------------------------------------------- #
+# POST /install-plan 响应
+# --------------------------------------------------------------------- #
+class InstallBatchItemOut(BaseModel):
+    """一个并行安装批次中的一个安装项：单包或一个循环强连通分量。
+
+    以 ``cyclic`` 为鉴别字段：cyclic=false 时为单包（``name``）；
+    cyclic=true 时为一个循环强连通分量（``packages`` 列出内部全部包，
+    按规范化包名排序），必须作为一个原子安装项处理。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    cyclic: bool = Field(
+        ...,
+        description=(
+            "false=单个包（非循环强连通分量），另带 name；"
+            "true=循环强连通分量，另带 packages，分量内包互相可达、"
+            "无法排序安装先后，须作为一个原子项安装。"
+        ),
+    )
+    name: str | None = Field(
+        None,
+        description="单包安装项的 PEP 503 规范化包名；cyclic=true 时为 null。",
+    )
+    packages: list[str] | None = Field(
+        None,
+        description=(
+            "循环分量内部的全部规范化包名，按包名排序；"
+            "cyclic=false 时为 null。"
+        ),
+    )
+
+
+class InstallPlanResponse(BaseModel):
+    """锁有效时的依赖优先并行安装计划。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    batches: list[list[InstallBatchItemOut]] = Field(
+        ...,
+        description=(
+            "并行安装批次，按安装先后排列：批次 0 的各项无任何依赖、"
+            "可最先并行安装；同一批内的项互不依赖、可并行安装。"
+            "任一依赖所在批次不会晚于依赖它的包，根包所在分量处于"
+            "最后一批。单包项为 {\"cyclic\": false, \"name\": ...}，"
+            "循环分量项为 {\"cyclic\": true, \"packages\": [...]}；"
+            "批内按单包名/分量成员名元组的字典序确定性排序。"
         ),
     )
 
